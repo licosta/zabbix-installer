@@ -72,6 +72,26 @@ docker compose ps
 
 ## Estado
 
-Version 1.0.0, certificada en maquinas virtuales reales con Debian 13.7
-(Zabbix 7.4 nativo en dos nodos y Zabbix 8.0 en Docker): esquema de la base de
-datos importado, hypertables creadas, servicios activos y frontend respondiendo.
+Version 1.0.0, certificada en maquinas virtuales reales con Debian 13.7:
+
+- **Zabbix 7.4 nativo** en dos nodos (servidor + base de datos).
+- **Zabbix 8.0 nativo** en dos nodos (servidor + base de datos).
+- **Zabbix 8.0 en Docker**.
+
+En las tres se verifico el arranque real de los servicios, el esquema importado en
+la base de datos (con sus hypertables), la respuesta HTTP del frontend, el token de
+la API y la recepcion de datos del agente.
+
+### Detalle de la API en Zabbix 8.0
+
+En la version 8.0 el campo `auth` del cuerpo JSON-RPC ya no se acepta. Tras
+`user.login` hay que enviar el token en la cabecera HTTP:
+
+```bash
+curl -s -X POST http://<servidor>:8080/api_jsonrpc.php \
+  -H 'Content-Type: application/json-rpc' \
+  -H "Authorization: Bearer <token>" \
+  -d '{"jsonrpc":"2.0","method":"host.get","params":{"output":["host"]},"id":1}'
+```
+
+En 7.0 y 7.4 el token se sigue pasando en el campo `auth` de primer nivel.
