@@ -74,13 +74,17 @@ docker compose ps
 
 Version 1.0.0, certificada en maquinas virtuales reales con Debian 13.7:
 
+- **Zabbix 7.0 nativo** en dos nodos (servidor + base de datos).
 - **Zabbix 7.4 nativo** en dos nodos (servidor + base de datos).
 - **Zabbix 8.0 nativo** en dos nodos (servidor + base de datos).
 - **Zabbix 8.0 en Docker**.
 
-En las tres se verifico el arranque real de los servicios, el esquema importado en
+En las cuatro se verifico el arranque real de los servicios, el esquema importado en
 la base de datos (con sus hypertables), la respuesta HTTP del frontend, el token de
 la API y la recepcion de datos del agente.
+
+Nota: el paquete oficial de Zabbix 7.0 y 8.0 no activa la compresion de TimescaleDB
+(la deja en manos de la propia aplicacion), mientras que el de 7.4 si la aplica.
 
 ### Detalle de la API en Zabbix 8.0
 
@@ -94,4 +98,5 @@ curl -s -X POST http://<servidor>:8080/api_jsonrpc.php \
   -d '{"jsonrpc":"2.0","method":"host.get","params":{"output":["host"]},"id":1}'
 ```
 
-En 7.0 y 7.4 el token se sigue pasando en el campo `auth` de primer nivel.
+En 7.0 y 7.4 el token se sigue pasando en el campo `auth` de primer nivel (verificado
+en las dos versiones).
