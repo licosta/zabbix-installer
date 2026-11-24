@@ -477,8 +477,16 @@ zbx_repo_base() {
     esac
 }
 
+# install_zabbix_repo <version> <paquete_requerido>
+#
+# El paquete que se valida es el que necesita de verdad el nodo en el que se
+# ejecuta: el nodo de base de datos solo necesita los scripts SQL y el nodo
+# servidor necesita el servidor con PostgreSQL. Exigir siempre el servidor
+# hacia fallar el despliegue del nodo de BD en las maquinas donde ese paquete
+# no esta disponible.
 install_zabbix_repo() {
     local ver="$1"
+    local required="${2:-zabbix-server-pgsql}"
     local base
     base="$(zbx_repo_base "${ver}")"
     local tmpdir
@@ -517,25 +525,29 @@ install_zabbix_repo() {
     dpkg -i "${deb}" >/dev/null 2>&1 || true
     apt-get install -f -y -qq >/dev/null 2>&1 || true
 
-    # El paquete deja su propia fuente en formato deb822 apuntando a la rama
-    # correcta. Se comprueba y, solo si hiciese falta, se escribe a mano.
+    if [[ ! -s /usr/share/keyrings/zabbix.gpg ]]; then
+        rm -rf "${tmpdir}"
+        die "El paquete zabbix-release no dejo la clave GPG en /usr/share/keyrings/zabbix.gpg; APT no podria verificar el repositorio."
+    fi
+
+    # La fuente se escribe SIEMPRE de forma explicita, apuntando a la rama que
+    # publica los binarios ('stable' en 7.4/8.0). El metapaquete zabbix-release
+    # deja ademas una fuente propia hacia la rama 'release', que publica
+    # UNICAMENTE el metapaquete (Architecture: all) y ningun binario: si esa
+    # fuente queda activa no hay ni zabbix-server-pgsql ni zabbix-sql-scripts.
+    # Comprobar solo la version de la rama no era suficiente, porque
+    # 'release/debian' tambien contiene '/zabbix/<ver>/'.
     local src="/etc/apt/sources.list.d/zabbix.sources"
-    if [[ ! -f "${src}" ]]; then
-        cat >/etc/apt/sources.list.d/zabbix.list <<ZBX_LIST_EOF
-deb [signed-by=/usr/share/keyrings/zabbix.gpg] ${base} ${DEBIAN_CODENAME} main
-ZBX_LIST_EOF
-    elif ! grep -q "/zabbix/${ver}/" "${src}"; then
-        log_warn "La fuente generada por el paquete no apunta a la rama ${ver}; se corrige."
-        cat >"${src}" <<ZBX_SRC_EOF
+    rm -f /etc/apt/sources.list.d/zabbix.list
+    cat >"${src}" <<ZBX_SRC_EOF
 Types: deb
 URIs: ${base}
 Suites: ${DEBIAN_CODENAME}
 Components: main
 Signed-By: /usr/share/keyrings/zabbix.gpg
 ZBX_SRC_EOF
-    fi
     # Se apartan las demas fuentes del paquete (release duplicada, unstable y
-    # tools) para que no pueda aparecer otra version de zabbix-server-pgsql.
+    # tools) para que no pueda aparecer otra version de los paquetes de Zabbix.
     mkdir -p /etc/apt/sources.list.d.disabled
     local extra
     for extra in zabbix-release.sources zabbix-unstable.sources zabbix-tools.sources; do
@@ -546,17 +558,24 @@ ZBX_SRC_EOF
 
     apt-get update -qq || die "No se pudieron actualizar los indices de APT tras configurar el repositorio de Zabbix."
     local candidate
-    candidate="$(apt-cache policy zabbix-server-pgsql 2>/dev/null | awk '/Candidate:/ {print $2}')"
+    candidate="$(apt-cache policy "${required}" 2>/dev/null | awk '/Candidate:/ {print $2}')"
     if [[ -z "${candidate}" || "${candidate}" == "(none)" ]]; then
-        die "El repositorio de Zabbix ${ver} no ofrece zabbix-server-pgsql para Debian ${DEBIAN_VERSION}."
+        log_error "Fuente configurada:"
+        log_error "  $(grep -E '^(URIs|Suites|Components):' "${src}" 2>/dev/null | tr '\n' ' ')"
+        log_error "Repositorios activos: $(ls /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null | tr '\n' ' ')"
+        log_error "Paquetes disponibles que coinciden con '${required}':"
+        apt-cache search --names-only "${required}" 2>/dev/null | awk '{print "    " $1}' | head -5 || true
+        rm -rf "${tmpdir}"
+        die "El repositorio de Zabbix ${ver} no ofrece ${required} para Debian ${DEBIAN_VERSION}."
     fi
     # El candidato puede llevar prefijo de epoch (1:7.4.13); se compara sin el.
     local candidate_ver="${candidate##*:}"
     if [[ "${candidate_ver}" != "${ver}"* ]]; then
-        die "El repositorio ofrece la version ${candidate} pero se ha solicitado la rama ${ver}."
+        rm -rf "${tmpdir}"
+        die "El repositorio ofrece la version ${candidate} de ${required} pero se ha solicitado la rama ${ver}."
     fi
     rm -rf "${tmpdir}"
-    log_ok "Repositorio de Zabbix ${ver} operativo (paquete ${candidate})."
+    log_ok "Repositorio de Zabbix ${ver} operativo (${required} ${candidate})."
 }
 
 # ---------------------------------------------------------------------------
@@ -1091,8 +1110,9 @@ install_db_node() {
     setup_db_role_and_database
     configure_pg_hba
 
-    # El esquema se importa con los scripts oficiales de Zabbix
-    install_zabbix_repo "${ZBX_VERSION}"
+    # El esquema se importa con los scripts oficiales de Zabbix. En este nodo
+    # no hace falta el servidor Zabbix: solo los scripts SQL.
+    install_zabbix_repo "${ZBX_VERSION}" "zabbix-sql-scripts"
     apt-get install -y -qq --no-install-recommends zabbix-sql-scripts >/dev/null 2>&1 \
         || die "No se pudo instalar zabbix-sql-scripts."
     install_db_schema
@@ -1342,7 +1362,7 @@ install_server_node() {
     opt_sysctl
     opt_disable_junk
 
-    install_zabbix_repo "${ZBX_VERSION}"
+    install_zabbix_repo "${ZBX_VERSION}" "zabbix-server-pgsql"
     log_step "Instalando los componentes de Zabbix ${ZBX_VERSION}"
     apt-get install -y -qq --no-install-recommends \
         zabbix-server-pgsql zabbix-frontend-php zabbix-nginx-conf \
