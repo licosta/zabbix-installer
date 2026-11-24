@@ -88,6 +88,11 @@ ZBX_HOSTNAME=""
 ZBX_DOCKER_DIR="$(pwd)"
 ZBX_LOG_FILE="/var/log/zabbix-install.log"
 
+# Version del paquete que sirve el repositorio de Zabbix para el nodo actual
+# (lo fija install_zabbix_repo). Se usa para comprobar que lo instalado
+# procede del repositorio de Zabbix y no de los repos de Debian.
+ZBX_REPO_PKG_VERSION=""
+
 CPU_CORES=1
 RAM_MB=2048
 
@@ -227,8 +232,8 @@ ask_password() {
             log_warn "Las contrasenas no coinciden."
             continue
         fi
-        if [[ "${#pwd}" -lt 12 ]]; then
-            log_warn "La contrasena debe tener al menos 12 caracteres."
+        if [[ "${#pwd}" -lt 10 ]]; then
+            log_warn "La contrasena debe tener al menos 10 caracteres."
             continue
         fi
         if [[ ! "${pwd}" =~ ^[A-Za-z0-9._~!@%+=:-]+$ ]]; then
@@ -302,7 +307,8 @@ check_os() {
 install_base_packages() {
     log_step "Instalando paquetes base"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq || die "No se pudieron actualizar los indices de APT. Revise la conectividad y las fuentes."
+    apt_update_robust "paquetes base" "" \
+        || die "No se pudieron actualizar los indices de APT. Revise la conectividad, el proxy y las fuentes (/etc/apt/sources.list)."
     # Paquetes imprescindibles: sin ellos no se pueden anadir repositorios externos.
     apt-get install -y -qq --no-install-recommends \
         ca-certificates curl wget gnupg lsb-release apt-transport-https \
@@ -329,6 +335,124 @@ set_timezone() {
     ln -sf "/usr/share/zoneinfo/${ZBX_TIMEZONE}" /etc/localtime
     echo "${ZBX_TIMEZONE}" >/etc/timezone
     log_ok "Zona horaria aplicada."
+}
+
+# ---------------------------------------------------------------------------
+# Gestion de los indices de APT
+# ---------------------------------------------------------------------------
+#
+# 'apt-get update' puede devolver 0 y dejar el indice SIN descargar: la
+# maquina resuelve el host pero la transferencia se queda a medias (red
+# intermitente, IPv6 sin ruta util, proxy que corta la descarga). En ese caso
+# 'apt-cache' no encuentra ningun paquete aunque el repositorio este bien
+# configurado, y el despliegue muere con un error que no explica nada. Es lo
+# que ocurrio en el nodo de base de datos: la fuente era correcta, pero el
+# indice del repositorio de Zabbix no habia aterrizado y un segundo
+# 'apt-get update' manual lo resolvio.
+#
+# Por eso no se fia del codigo de salida: se comprueba que el indice este
+# realmente en disco (/var/lib/apt/lists) y se reintenta con opciones cada vez
+# mas agresivas hasta que aparece.
+
+# Log con la salida completa de los 'apt-get update' (para diagnostico).
+readonly APT_UPDATE_LOG="/tmp/zabbix-apt-update.err"
+
+# apt_index_paths <base_url>
+# Rutas de los ficheros de indice que APT usa para el repositorio indicado.
+# Se sacan de 'apt-get indextargets' (la misma informacion que usa APT) en
+# lugar de deducirlas del nombre de la URL.
+apt_index_paths() {
+    local base="${1%/}"
+    [[ -n "${base}" ]] || return 0
+    apt-get indextargets 2>/dev/null | awk -v base="${base}" '
+        /^Filename:/ { file = $2; next }
+        /^Repo-URI:/  { if (index($2, base) > 0 && file != "") { print file; file = "" } }
+    '
+}
+
+# apt_index_present <base_url>
+# Devuelve 0 si el indice del repositorio esta descargado y es utilizable.
+apt_index_present() {
+    local base="${1%/}" f
+    [[ -n "${base}" ]] || return 1
+    while read -r f; do
+        [[ -n "${f}" ]] || continue
+        [[ -s "${f}" ]] || continue
+        [[ "${f}" == *.new ]] && continue
+        return 0
+    done < <(apt_index_paths "${base}")
+    return 1
+}
+
+# apt_pkg_from_repo <paquete> <base_url>
+# Imprime la version del paquete tal y como la sirve ese repositorio y
+# devuelve 0; si el repositorio no lo ofrece, devuelve 1.
+#
+# No se usa 'Candidate:'. APT puede tomar el candidato de
+# /var/lib/dpkg/status (paquete ya instalado) o de OTRO repositorio: los
+# repos de Debian ofrecen zabbix-server-pgsql 7.0 mientras la rama 8.0 ofrece
+# la 2:8.0.0, y lo que importa es la version que sirve ESTE repositorio.
+apt_pkg_from_repo() {
+    local pkg="$1" base="${2%/}" policy ver
+    [[ -n "${base}" ]] || return 1
+    policy="$(apt-cache policy "${pkg}" 2>/dev/null || true)"
+    ver="$(awk -v base="${base}" '
+        $1 == "***"       { ver = $2; next }
+        $1 ~ /^[0-9]+:/  { ver = $1; next }
+        index($0, base) > 0 { if (ver != "") { print ver; exit } }
+    ' <<<"${policy}")"
+    [[ -n "${ver}" ]] || return 1
+    printf '%s' "${ver}"
+    return 0
+}
+
+# apt_update_robust <etiqueta> <base_url> [paquete]
+#
+# Actualiza los indices de APT hasta que el indice del repositorio (o el
+# paquete indicado) queda disponible. Cada reintento es mas agresivo que el
+# anterior:
+#   1) intento normal
+#   2) forzando IPv4 (en redes con IPv6 roto APT resuelve el host y se queda
+#      sin indice aunque el update devuelva 0)
+#   3) regenerando por completo la cache local de APT
+#
+# Sin <base_url> ni <paquete> basta con que 'apt-get update' termine bien.
+apt_update_robust() {
+    local label="$1" base="${2%/}" pkg="${3:-}" attempt ver rc=0
+    local -a opts=()
+    for attempt in 1 2 3; do
+        case "${attempt}" in
+            2) opts=("-o" "Acquire::ForceIPv4=true") ;;
+            3) opts=("-o" "Acquire::ForceIPv4=true" "-o" "Acquire::Retries=5")
+               rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+               apt-get clean >/dev/null 2>&1 || true ;;
+        esac
+        {
+            printf '=== apt-get update [%s] intento %s/3 (%s) ===\n' \
+                "${label}" "${attempt}" "$(date -Is)"
+        } >>"${APT_UPDATE_LOG}"
+        if ! apt-get update "${opts[@]+"${opts[@]}"}" -o Acquire::Retries=3 \
+                -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+                >>"${APT_UPDATE_LOG}" 2>&1; then
+            rc=1
+            log_warn "apt-get update devolvio un error (intento ${attempt}/3). Detalle en ${APT_UPDATE_LOG}."
+        fi
+        if [[ -n "${pkg}" ]]; then
+            if ver="$(apt_pkg_from_repo "${pkg}" "${base}")"; then
+                return 0
+            fi
+            log_warn "El paquete ${pkg} todavia no aparece en el indice de ${label} (intento ${attempt}/3)."
+        elif [[ -n "${base}" ]]; then
+            if apt_index_present "${base}"; then
+                return 0
+            fi
+            log_warn "El indice de ${label} todavia no esta disponible (intento ${attempt}/3)."
+        else
+            [[ "${rc}" == "0" ]] && return 0
+            continue
+        fi
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -477,6 +601,58 @@ zbx_repo_base() {
     esac
 }
 
+# zbx_repo_publishes_pkg <base_url> <paquete>
+# Consulta el indice del repositorio de Zabbix para saber si publica el
+# paquete para la suite actual, tanto en 'binary-all' como en la arquitectura
+# nativa. Permite distinguir "el repositorio no lo tiene" de "APT local esta
+# roto", que de otro modo dan el mismo error.
+#
+# Devuelve:
+#   0  el repositorio publica el paquete
+#   1  el repositorio se pudo consultar y NO publica el paquete
+#   2  no se pudo consultar el repositorio (fallo de red)
+#
+# El indice se descarga a un fichero, no a un pipe: con 'set -o pipefail' un
+# fallo intermedio devuelve el estado del pipeline y el contenido se pierde,
+# que es lo que hacia que un simple fallo de red seagara como "el repositorio
+# no publica el paquete".
+zbx_repo_publishes_pkg() {
+    local base="$1" pkg="$2" arch bin tmp rc=2
+    arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+    tmp="$(mktemp)"
+    for bin in "all" "${arch}"; do
+        if curl -fsSL --retry 2 --connect-timeout 20 \
+                "${base}dists/${DEBIAN_CODENAME}/main/binary-${bin}/Packages.gz" \
+                -o "${tmp}" 2>/dev/null; then
+            rc=1
+            if gzip -dc "${tmp}" > "${tmp}.txt" 2>/dev/null \
+                    && grep -qE "^Package: ${pkg}$" "${tmp}.txt"; then
+                rm -f "${tmp}" "${tmp}.txt"
+                return 0
+            fi
+        fi
+    done
+    rm -f "${tmp}" "${tmp}.txt"
+    return "${rc}"
+}
+
+# verify_zabbix_pkg_installed <paquete>
+# Comprueba que el paquete instalado es el de la rama de Zabbix pedida y no
+# el que ofrecen los repos de Debian (que va por detras en version). Sin esta
+# comprobacion, un indice de Zabbix ausente instalaria el Zabbix 7.0 de
+# Debian junto al esquema 8.0 en la base de datos.
+verify_zabbix_pkg_installed() {
+    local pkg="$1" installed branch
+    installed="$(dpkg-query -W -f='${Version}' "${pkg}" 2>/dev/null || true)"
+    [[ -n "${installed}" ]] || return 0
+    branch="${installed##*:}"   # quita el epoch (2:8.0.0-1+debian13 -> 8.0.0-1+debian13)
+    branch="${branch%%-*}"      # y el sufijo de la revision (-> 8.0.0)
+    if [[ "${branch}" != "${ZBX_VERSION}"* ]]; then
+        die "El paquete ${pkg} instalado es la version ${installed}, pero se esperaba la rama ${ZBX_VERSION} del repositorio de Zabbix. Revise el indice del repositorio de Zabbix."
+    fi
+    return 0
+}
+
 # install_zabbix_repo <version> <paquete_requerido>
 #
 # El paquete que se valida es el que necesita de verdad el nodo en el que se
@@ -556,26 +732,67 @@ ZBX_SRC_EOF
         fi
     done
 
-    apt-get update -qq || die "No se pudieron actualizar los indices de APT tras configurar el repositorio de Zabbix."
-    local candidate
-    candidate="$(apt-cache policy "${required}" 2>/dev/null | awk '/Candidate:/ {print $2}')"
-    if [[ -z "${candidate}" || "${candidate}" == "(none)" ]]; then
+    # Actualizar los indices comprobando que el indice del repositorio queda
+    # REALMENTE en disco. Un 'apt-get update' puede devolver 0 sin dejar el
+    # indice (red intermitente o IPv6 sin ruta) y el despliegue continuaria
+    # sin ver ningun paquete de Zabbix.
+    if ! apt_update_robust "Zabbix ${ver}" "${base}"; then
+        log_error "No se pudo dejar disponible el indice del repositorio de Zabbix ${ver}."
         log_error "Fuente configurada:"
-        log_error "  $(grep -E '^(URIs|Suites|Components):' "${src}" 2>/dev/null | tr '\n' ' ')"
-        log_error "Repositorios activos: $(ls /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null | tr '\n' ' ')"
-        log_error "Paquetes disponibles que coinciden con '${required}':"
-        apt-cache search --names-only "${required}" 2>/dev/null | awk '{print "    " $1}' | head -5 || true
+        local srcinfo="" actsrc=""
+        srcinfo="$(grep -E '^(URIs|Suites|Components):' "${src}" 2>/dev/null || true)"
+        log_error "  ${srcinfo//$'\n'/ }"
+        log_error "Arquitectura de la maquina: $(dpkg --print-architecture 2>/dev/null || echo '?')"
+        actsrc="$(ls /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true)"
+        log_error "Repositorios activos: ${actsrc//$'\n'/ }"
+        log_error "Indices que APT espera para este repositorio:"
+        apt_index_paths "${base}" | while read -r f; do
+            if [[ -s "${f}" ]]; then
+                log_error "  ${f}: descargado"
+            else
+                log_error "  ${f}: NO DESCARGADO"
+            fi
+        done
+        log_error "Ultimas lineas de 'apt-get update' (${APT_UPDATE_LOG}):"
+        tail -n 15 "${APT_UPDATE_LOG}" 2>/dev/null | while read -r l; do log_error "  ${l}"; done
+        log_error "Pruebe a mano: apt-get update && apt-get install -y ${required}"
+        rm -rf "${tmpdir}"
+        die "No se pudo actualizar el indice del repositorio de Zabbix ${ver} para Debian ${DEBIAN_VERSION}."
+    fi
+
+    # La version que importa es la que sirve el repositorio de Zabbix, no la
+    # que APT propone como candidata: los repos de Debian ofrecen Zabbix 7.0
+    # y el candidato caeria ahi si el indice de Zabbix no estuviera.
+    local pkg_ver
+    if ! pkg_ver="$(apt_pkg_from_repo "${required}" "${base}")"; then
+        log_error "El repositorio de Zabbix ${ver} no ofrece ${required} para Debian ${DEBIAN_VERSION}."
+        local pub_rc=0
+        zbx_repo_publishes_pkg "${base}" "${required}" || pub_rc=$?
+        case "${pub_rc}" in
+            0) log_error "El repositorio SI publica ${required} para ${DEBIAN_CODENAME}: el problema es local (indice de APT no descargado, clave GPG o proxy)." ;;
+            1) log_error "El repositorio NO publica ${required} para ${DEBIAN_CODENAME} ($(dpkg --print-architecture 2>/dev/null || echo '?'))." ;;
+            *) log_error "No se pudo consultar el repositorio (fallo de red al descargar el indice): no se puede confirmar si publica ${required}." ;;
+        esac
+        local other
+        other="$(apt-cache policy "${required}" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+        if [[ -n "${other}" && "${other}" != "(none)" ]]; then
+            log_error "Hay una version ${other} de ${required} en otro repositorio, pero no es la de la rama ${ver}."
+        fi
+        log_error "Ultimas lineas de 'apt-get update' (${APT_UPDATE_LOG}):"
+        tail -n 15 "${APT_UPDATE_LOG}" 2>/dev/null | while read -r l; do log_error "  ${l}"; done
         rm -rf "${tmpdir}"
         die "El repositorio de Zabbix ${ver} no ofrece ${required} para Debian ${DEBIAN_VERSION}."
     fi
-    # El candidato puede llevar prefijo de epoch (1:7.4.13); se compara sin el.
-    local candidate_ver="${candidate##*:}"
-    if [[ "${candidate_ver}" != "${ver}"* ]]; then
+    # La version puede llevar prefijo de epoch (2:8.0.0-1+debian13); se
+    # compara sin el.
+    local pkg_ver_num="${pkg_ver##*:}"
+    if [[ "${pkg_ver_num}" != "${ver}"* ]]; then
         rm -rf "${tmpdir}"
-        die "El repositorio ofrece la version ${candidate} de ${required} pero se ha solicitado la rama ${ver}."
+        die "El repositorio de Zabbix ofrece la version ${pkg_ver} de ${required} pero se ha solicitado la rama ${ver}."
     fi
+    ZBX_REPO_PKG_VERSION="${pkg_ver}"
     rm -rf "${tmpdir}"
-    log_ok "Repositorio de Zabbix ${ver} operativo (${required} ${candidate})."
+    log_ok "Repositorio de Zabbix ${ver} operativo (${required} ${pkg_ver})."
 }
 
 # ---------------------------------------------------------------------------
@@ -704,59 +921,52 @@ open_port() {
 # NODO BASE DE DATOS: PostgreSQL + TimescaleDB
 # ---------------------------------------------------------------------------
 
-# Indica si un paquete esta disponible en un REPOSITORIO de APT.
+# Indica si un paquete esta disponible en el REPOSITORIO de TimescaleDB.
 # No basta con mirar 'Candidate:': cuando el paquete ya esta INSTALLED, APT
 # usa /var/lib/dpkg/status como origen del candidato aunque el repositorio no
 # este configurado. Tomarse ese candidato por uno del repositorio hacia que
 # el script se salte la configuracion de la fuente y falle despues sin
-# explicacion. Se busca, por tanto, una entrada de la tabla de versiones con
-# origen http(s) (las de /var/lib/dpkg/status no lo tienen).
+# explicacion. Se busca, por tanto, la version que sirve ESTE repositorio.
 ts_pkg_in_repo() {
-    local pkg="$1" policy
-    policy="$(apt-cache policy "${pkg}" 2>/dev/null || true)"
-    grep -qE "^[[:space:]]+[0-9]+[[:space:]]+https?://" <<<"${policy}"
+    local pkg="$1"
+    apt_pkg_from_repo "${pkg}" "${TS_REPO_BASE}" >/dev/null
 }
 
 # Consulta al repositorio de packagecloud si publica un paquete concreto para
 # la suite y arquitectura actuales. Permite distinguir "el repositorio no lo
 # tiene" de "APT local esta roto", que es la raiz del error reportado.
+#
+# Devuelve 0 si lo publica, 1 si el repositorio se pudo consultar y no lo
+# publica, y 2 si no se pudo consultar (fallo de red).
 ts_repo_publishes_pkg() {
-    local base="$1" pkg="$2" arch="$3" idx
-    idx="$(curl -fsSL --retry 2 --connect-timeout 20 \
-            "${base}dists/${DEBIAN_CODENAME}/main/binary-${arch}/Packages.gz" 2>/dev/null \
-            | gzip -dc 2>/dev/null || true)"
-    [[ -n "${idx}" ]] || return 1
-    grep -qE "^Package: ${pkg}$" <<<"${idx}"
+    local base="$1" pkg="$2" arch="$3" tmp rc=2
+    tmp="$(mktemp)"
+    if curl -fsSL --retry 2 --connect-timeout 20 \
+            "${base}dists/${DEBIAN_CODENAME}/main/binary-${arch}/Packages.gz" \
+            -o "${tmp}" 2>/dev/null; then
+        rc=1
+        if gzip -dc "${tmp}" > "${tmp}.txt" 2>/dev/null \
+                && grep -qE "^Package: ${pkg}$" "${tmp}.txt"; then
+            rm -f "${tmp}" "${tmp}.txt"
+            return 0
+        fi
+    fi
+    rm -f "${tmp}" "${tmp}.txt"
+    return "${rc}"
 }
 
 # Actualiza los indices y busca un paquete de TimescaleDB utilizable.
-# force_ipv4=1 reintenta por IPv4, necesario en redes con IPv6 roto: APT
-# resuelve el host y se queda sin indice si la ruta IPv6 no responde.
-# En el segundo intento se regenera por completo la cache local de APT.
+# No se fia del codigo de salida de 'apt-get update': se comprueba que el
+# indice del repositorio quede en disco y se reintenta con opciones cada vez
+# mas agresivas (normal, forzando IPv4 y regenerando la cache local).
 ts_try_repo_update() {
-    local force_ipv4="$1"
-    local apt_err="/tmp/zabbix-apt-update.err"
-    local -a opts=()
-    [[ "${force_ipv4}" == "1" ]] && opts+=("-o" "Acquire::ForceIPv4=true")
-    local attempt pkg
-    for attempt in 1 2; do
-        if [[ "${attempt}" == "2" ]]; then
-            rm -rf /var/lib/apt/lists/* 2>/dev/null || true
-            apt-get clean >/dev/null 2>&1 || true
-        else
-            rm -f /var/lib/apt/lists/*timescale* 2>/dev/null || true
+    local pkg
+    apt_update_robust "TimescaleDB" "${TS_REPO_BASE}" >/dev/null
+    for pkg in "${TS_PKG_CANDIDATES[@]}"; do
+        if ts_pkg_in_repo "${pkg}"; then
+            TS_PKG="${pkg}"
+            return 0
         fi
-        if ! apt-get update ${opts[@]+"${opts[@]}"} -o Acquire::Retries=3 -qq 2>"${apt_err}"; then
-            log_warn "apt-get update devolvio un error:"
-            while read -r line; do log_warn "  ${line}"; done <"${apt_err}"
-        fi
-        for pkg in "${TS_PKG_CANDIDATES[@]}"; do
-            if ts_pkg_in_repo "${pkg}"; then
-                TS_PKG="${pkg}"
-                return 0
-            fi
-        done
-        log_warn "El indice de TimescaleDB aun no esta disponible; se reintenta (intento ${attempt}/2)."
     done
     return 1
 }
@@ -819,25 +1029,19 @@ TS_EOF
     chmod 0644 "${src}"
     log_info_dim "Fuente: ${TS_REPO_BASE} ${DEBIAN_CODENAME} main"
 
-    if ts_try_repo_update 0; then
-        log_ok "Repositorio de TimescaleDB operativo (${TS_PKG})."
-        return 0
-    fi
-
-    # Sin indice por la ruta habitual: se reintenta forzando IPv4, que es la
-    # causa habitual en redes con IPv6 sin ruta util.
-    log_warn "Sin indice de TimescaleDB; se reintenta forzando IPv4."
-    if ts_try_repo_update 1; then
+    if ts_try_repo_update; then
         log_ok "Repositorio de TimescaleDB operativo (${TS_PKG})."
         return 0
     fi
 
     # Diagnostico del fallo: se consulta el indice del repositorio directamente.
-    if ts_repo_publishes_pkg "${TS_REPO_BASE}" "${TS_PKG_CANDIDATES[0]}" "${arch}"; then
-        log_warn "El repositorio si publica ${TS_PKG_CANDIDATES[0]} para ${DEBIAN_CODENAME}; el problema es local (cache de APT, GPG o proxy)."
-    else
-        log_warn "El repositorio no publica ${TS_PKG_CANDIDATES[0]} para ${DEBIAN_CODENAME} (${arch})."
-    fi
+    local ts_pub_rc=0
+    ts_repo_publishes_pkg "${TS_REPO_BASE}" "${TS_PKG_CANDIDATES[0]}" "${arch}" || ts_pub_rc=$?
+    case "${ts_pub_rc}" in
+        0) log_warn "El repositorio si publica ${TS_PKG_CANDIDATES[0]} para ${DEBIAN_CODENAME}; el problema es local (cache de APT, GPG o proxy)." ;;
+        1) log_warn "El repositorio no publica ${TS_PKG_CANDIDATES[0]} para ${DEBIAN_CODENAME} (${arch})." ;;
+        *) log_warn "No se pudo consultar el repositorio de TimescaleDB (fallo de red): no se puede confirmar si publica ${TS_PKG_CANDIDATES[0]}." ;;
+    esac
     log_error "No se pudo dejar operativo el repositorio de TimescaleDB."
     log_error "Revise /tmp/zabbix-apt-update.err y la salida de 'apt-get update' para el detalle del error."
     die "No hay paquete ${TS_PKG_CANDIDATES[0]} disponible para ${DEBIAN_CODENAME}."
@@ -1114,7 +1318,8 @@ install_db_node() {
     # no hace falta el servidor Zabbix: solo los scripts SQL.
     install_zabbix_repo "${ZBX_VERSION}" "zabbix-sql-scripts"
     apt-get install -y -qq --no-install-recommends zabbix-sql-scripts >/dev/null 2>&1 \
-        || die "No se pudo instalar zabbix-sql-scripts."
+        || die "No se pudo instalar zabbix-sql-scripts desde el repositorio de Zabbix ${ZBX_VERSION}."
+    verify_zabbix_pkg_installed zabbix-sql-scripts
     install_db_schema
 
     open_port "${ZBX_DB_PORT}" tcp "${ZBX_SERVER_IP}"
@@ -1311,7 +1516,11 @@ configure_agent() {
     local conf="/etc/zabbix/zabbix_agent2.conf"
     [[ -f "${conf}" ]] || die "No se encuentra ${conf}."
     # El agente del propio nodo servidor se comunica con el Zabbix server local.
-    set_conf "${conf}" "Server"        "127.0.0.1"
+    # Se admiten tanto el loopback como la IP del servidor: el 'Server' decide
+    # que conexiones entrantes al agente se aceptan, y el Zabbix server
+    # consulta el agente en la interfaz del host (que se deja en la IP del
+    # servidor para que el host sea monitorizable desde cualquier nodo).
+    set_conf "${conf}" "Server"        "${ZBX_SERVER_IP},127.0.0.1"
     set_conf "${conf}" "ServerActive"  "${ZBX_SERVER_IP}"
     set_conf "${conf}" "Hostname"      "${ZBX_HOSTNAME}"
     set_conf "${conf}" "LogType"       "file"
@@ -1355,6 +1564,79 @@ PHPINI_EOF
     log_ok "PHP ${php_ver} optimizado (pm.max_children=${max_children})."
 }
 
+# register_local_host
+#
+# El esquema de Zabbix crea un host llamado "Zabbix server" cuya interfaz de
+# agente apunta a 127.0.0.1. El agente2 de este nodo se configura en modo
+# activo (ServerActive=<IP del servidor>) con Hostname=<nombre del equipo>, y
+# el servidor no encuentra ese hostname: el agente repite "host not found" y no
+# llega ningun item.
+#
+# Se renombra el host real de la base de datos con el nombre del equipo y se
+# apunta su interfaz de agente a la IP del servidor, de modo que el agente
+# activo y el host registrado coincidan.
+register_local_host() {
+    log_step "Registrando el host del nodo servidor en la base de datos"
+    local hname="${ZBX_HOSTNAME}"
+    hname="${hname//[^A-Za-z0-9._-]/}"
+    [[ -n "${hname}" ]] || hname="zabbix-server"
+
+    local -a psql_cmd=(psql -h "${ZBX_DB_HOST}" -p "${ZBX_DB_PORT}"
+                      -U "${ZBX_DB_USER}" -d "${ZBX_DB_NAME}" -tAc)
+
+    # El esquema cambio en Zabbix 8.0: no existe la tabla 'templates' (las
+    # plantillas son filas de 'hosts') y la tabla de interfaces se llama
+    # 'interface' en singular. En 7.0/7.4 son 'templates' e 'interfaces'.
+    local n_templates iface_tab
+    n_templates="$(PGPASSWORD="${ZBX_DB_PASSWORD}" "${psql_cmd[@]}" \
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='templates';" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "${n_templates}" == "1" ]]; then
+        iface_tab="interfaces"
+    else
+        iface_tab="interface"
+    fi
+
+    # El host real es el del esquema ("Zabbix server"), reconocible tambien
+    # por su interfaz de agente apuntando a 127.0.0.1. El nombre nuevo se
+    # incluye para que la operacion sea idempotente. La tabla 'hosts_templates'
+    # NO sirve para esto: solo relaciona los hosts que tienen plantilla
+    # asignada, no distingue las filas que son plantilla.
+    local host_ids="SELECT hostid FROM hosts WHERE host='Zabbix server'
+                    UNION SELECT hostid FROM ${iface_tab} WHERE type=1 AND ip='127.0.0.1'
+                    UNION SELECT hostid FROM hosts WHERE host='${hname}'"
+
+    # Salvaguarda: si la seleccion no es univoca NO se modifica nada. Renombrar
+    # las filas equivocadas (las plantillas viven tambien en la tabla hosts)
+    # dejaria el despliegue inservible.
+    local n_hosts
+    n_hosts="$(PGPASSWORD="${ZBX_DB_PASSWORD}" "${psql_cmd[@]}" \
+        "SELECT count(*) FROM hosts WHERE hostid IN (${host_ids});" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "${n_hosts}" != "1" ]]; then
+        log_warn "Se han encontrado ${n_hosts:-0} hosts candidatos en la base de datos; no se renombra ninguno para no tocar las plantillas."
+        log_warn "Registre el host a mano con el nombre '${hname}' en el frontend de Zabbix."
+        return 0
+    fi
+
+    if ! PGPASSWORD="${ZBX_DB_PASSWORD}" "${psql_cmd[@]}" \
+            "UPDATE hosts SET host='${hname}', name='${hname}' WHERE hostid IN (${host_ids});" >/dev/null 2>&1; then
+        log_warn "No se pudo renombrar el host en la base de datos (compruebe la conectividad con ${ZBX_DB_HOST})."
+        return 0
+    fi
+    PGPASSWORD="${ZBX_DB_PASSWORD}" "${psql_cmd[@]}" \
+        "UPDATE ${iface_tab} SET useip=1, ip='${ZBX_SERVER_IP}', dns='', port='10050' WHERE hostid IN (${host_ids}) AND type=1;" \
+        >/dev/null 2>&1 || log_warn "No se pudo actualizar la interfaz del agente en la base de datos."
+
+    local current
+    current="$(PGPASSWORD="${ZBX_DB_PASSWORD}" "${psql_cmd[@]}" \
+        "SELECT host FROM hosts WHERE hostid IN (${host_ids}) LIMIT 1;" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "${current}" == "${hname}" ]]; then
+        log_ok "Host '${hname}' registrado en la base de datos (agente en ${ZBX_SERVER_IP}:10050)."
+    else
+        log_warn "El host de la base de datos sigue llamandose '${current:-?}': el agente no encontrara su host."
+    fi
+    return 0
+}
+
 install_server_node() {
     section "NODO SERVIDOR ZABBIX - server + frontend + agent2"
     install_base_packages
@@ -1370,6 +1652,11 @@ install_server_node() {
         "postgresql-client-${PG_VERSION}" \
         smartmontools nginx >/dev/null 2>&1 \
         || die "Fallo al instalar los componentes de Zabbix ${ZBX_VERSION}."
+    # Los repos de Debian ofrecen Zabbix 7.0: si el indice del repositorio de
+    # Zabbix no estuviera, se instalaria esa version junto al esquema 8.0.
+    verify_zabbix_pkg_installed zabbix-server-pgsql
+    verify_zabbix_pkg_installed zabbix-frontend-php
+    verify_zabbix_pkg_installed zabbix-agent2
 
     # PHP-FPM y extensiones exigidas por el frontend (Debian 13 = PHP 8.4)
     local php_pkg_ver
@@ -1403,6 +1690,7 @@ install_server_node() {
     done
     if [[ "${db_ready}" == "1" ]]; then
         log_ok "Base de datos accesible en ${ZBX_DB_HOST}:${ZBX_DB_PORT}."
+        register_local_host
     else
         log_warn "No se pudo confirmar la conexion con ${ZBX_DB_HOST}:${ZBX_DB_PORT}."
         log_warn "Verifique que el nodo de base de datos esta instalado y que pg_hba.conf permite ${ZBX_SERVER_IP}."
@@ -1473,7 +1761,11 @@ install_server_node() {
     # Comprobacion funcional del frontend ( Nginx y PHP-FPM ya estan arrancados).
     local ftry fcode=""
     for ftry in $(seq 1 15); do
-        fcode="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ZBX_WEB_PORT}/" 2>/dev/null || true)"
+        # Dentro de un 'if' el fallo de curl no dispara el trap ERR del
+        # script, que abortaria el instalador al vaciar la sustitucion.
+        if ! fcode="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ZBX_WEB_PORT}/" 2>/dev/null)"; then
+            fcode=""
+        fi
         case "${fcode}" in
             200|302) break ;;
         esac
