@@ -45,6 +45,21 @@ readonly DEBIAN_CODENAME="trixie"
 readonly DEBIAN_VERSION="13"
 readonly PG_VERSION="17"
 
+# Repositorio de TimescaleDB en packagecloud.
+readonly TS_REPO_BASE="https://packagecloud.io/timescale/timescaledb/debian/"
+
+# Paquetes de TimescaleDB que se buscan, por orden de preferencia:
+#   1) Community Edition (licencia "timescale"): es la que Zabbix exige y la
+#      unica que admite compresion.
+#   2) Apache 2 Edition (licencia "apache"): mismo repositorio; arranca el
+#      servidor, pero sin compresion.
+TS_PKG_CANDIDATES=(
+    "timescaledb-2-postgresql-${PG_VERSION}"
+    "timescaledb-2-oss-postgresql-${PG_VERSION}"
+)
+# Paquete de TimescaleDB finalmente elegido (lo fija install_timescaledb_repo).
+TS_PKG=""
+
 # Imagen de TimescaleDB para Docker (PostgreSQL 17, Community Edition con compresion)
 # La imagen de TimescaleDB debe ser compatible con la version de Zabbix.
 ts_image_tag() {
@@ -320,16 +335,137 @@ set_timezone() {
 # Repositorio oficial de Zabbix
 # ---------------------------------------------------------------------------
 
-# Version maxima de TimescaleDB aceptada por cada rama de Zabbix.
-# El servidor Zabbix rechaza las versiones mas nuevas ("TimescaleDB version is
-# too new"): 7.0 y 8.0 admiten hasta 2.29.x y 7.4 hasta 2.30.x.
+# ---------------------------------------------------------------------------
+# Compatibilidad Zabbix <-> TimescaleDB
+# ---------------------------------------------------------------------------
+#
+# El servidor Zabbix comprueba la version de la extension al arrancar y
+# ABORTA si queda fuera del rango que fija su propio codigo
+# (include/zbx_dbversion_constants.h). La comparacion es numerica
+# (major*10000 + minor*100 + patch), de modo que 2.29.3 es valida
+# (22903 <= 22999) y 2.31.2 NO lo es (23102 > 22999): con 2.31.x o 2.32.x el
+# servidor muere con "TimescaleDB version is too new".
+
+# Limites de version de TimescaleDB por RAMA de Zabbix.
+#
+# Estos son los limites de las revisiones QUE ESTAN EMPAQUETADAS para
+# Debian 13 en repo.zabbix.com. OJO: el limite cambia entre revisiones de una
+# misma rama, asi que no sirve mirar la rama de GitHub sino el release:
+#
+#   rama  release empaquetado  min soportada   max admitida
+#   7.0   7.0.32               2.13.0          2.30.x  (23099)
+#   7.4   7.4.16               2.13.0          2.30.x  (23099)
+#   8.0   8.0.0                2.20.0          2.29.x  (22999)
+#
+# Por ejemplo, Zabbix 8.0.0 RECHAZA 2.31.x ("TimescaleDB version is too new")
+# aunque las revisiones posteriores de la rama 8.0 ya lo admitan. Ademas, el
+# repositorio de packagecloud ya publica 2.32.x, que ninguna de estas ramas
+# acepta: instalar "la ultima disponible" deja el servidor sin arrancar.
+#
+# El limite solo sube dentro de una rama, de modo que elegir la revision mas
+# nueva de la serie maxima indicada sigue siendo valido para las revisiones
+# posteriores. La comprobacion final en el nodo servidor contrasta el rango
+# con el binario zabbix_server instalado, que es la fuente autoritativa.
+
+# Version minima soportada por la rama de Zabbix elegida.
+zbx_tsdb_min_version() {
+    case "$1" in
+        8.0) printf '%s' "2.20.0" ;;
+        *)   printf '%s' "2.13.0" ;;
+    esac
+}
+
+# Version maxima admitida, expresada como la revision mas alta de la serie
+# maxima (2.29.99 equivale al limite 22999 del codigo de Zabbix).
+zbx_tsdb_max_version() {
+    case "$1" in
+        8.0) printf '%s' "2.29.99" ;;
+        *)   printf '%s' "2.30.99" ;;
+    esac
+}
+
+# Version maxima concreta que se instala (y la que se usa en Docker).
 zbx_max_ts_version() {
     case "$1" in
-        7.0) printf '%s' "2.29.2" ;;
-        7.4) printf '%s' "2.30.2" ;;
-        8.0) printf '%s' "2.29.2" ;;
-        *)   printf '%s' "2.29.2" ;;
+        7.0) printf '%s' "2.30.3" ;;
+        7.4) printf '%s' "2.30.3" ;;
+        8.0) printf '%s' "2.29.3" ;;
+        *)   printf '%s' "2.30.3" ;;
     esac
+}
+
+# Limite de version de TimescaleDB que admite el zabbix-server INSTALADO.
+# Se extrae del propio binario, que es la fuente autoritativa: el limite
+# puede variar entre revisiones de una misma rama y la tabla anterior solo
+# refleja el release empaquetado en el momento de escribir el script.
+zbx_server_tsdb_max() {
+    local bin v
+    bin="$(command -v zabbix_server 2>/dev/null || echo /usr/sbin/zabbix_server)"
+    [[ -r "${bin}" ]] || return 1
+    # Sin 'head' en la tuberia: con 'pipefail', un SIGPIPE (141) al cortarla
+    # haria fallar la asignacion y abortaria el script.
+    v="$(grep -aoE '[0-9]{1,2}\.[0-9]{1,2}\.x' "${bin}" 2>/dev/null \
+         | grep -E '^2\.[0-9]{1,2}\.x$' | sort -u || true)"
+    v="${v%%$'\n'*}"
+    [[ -n "${v}" ]] || return 1
+    # "2.29.x" -> "2.29.99"
+    printf '%s.99' "${v%.x}"
+}
+
+# --- Comparadores de version numericos (X.Y.Z) ---------------------------
+# Se ignoran los sufijos de empaquetado ("~debian13-1712"), el revision de
+# Debian ("-1") y la epoca ("1:"), que no forman parte del numero de version.
+
+ts_ver_core() {
+    local v="$1"
+    v="${v%%~*}"
+    v="${v%%-*}"
+    v="${v##*:}"
+    printf '%s' "${v}"
+}
+
+# Compara dos versiones numericamente y devuelve -1, 0 o 1 segun $1 sea
+# menor, igual o mayor que $2. Solo se consideran los tres primeros
+# componentes, igual que hace Zabbix (major*10000 + minor*100 + patch).
+ts_ver_cmp() {
+    local a b
+    local -a ca cb
+    local IFS=.
+    a="$(ts_ver_core "$1")"
+    b="$(ts_ver_core "$2")"
+    read -r -a ca <<<"${a}"
+    read -r -a cb <<<"${b}"
+    local i va vb
+    for (( i = 0; i < 3; i++ )); do
+        va="${ca[i]:-0}"; vb="${cb[i]:-0}"
+        va="${va//[!0-9]/}"; vb="${vb//[!0-9]/}"
+        [[ -n "${va}" ]] || va=0
+        [[ -n "${vb}" ]] || vb=0
+        if (( 10#${va} < 10#${vb} )); then printf '%s' "-1"; return 0; fi
+        if (( 10#${va} > 10#${vb} )); then printf '%s' "1";  return 0; fi
+    done
+    printf '%s' "0"
+}
+
+# Devuelve 0 si $1 >= $2.
+ts_ver_ge() { [[ "$(ts_ver_cmp "$1" "$2")" -ge 0 ]]; }
+
+# Devuelve 0 si $1 <= $2.
+ts_ver_le() { [[ "$(ts_ver_cmp "$1" "$2")" -le 0 ]]; }
+
+# Devuelve la version mas reciente del paquete que este dentro del rango
+# [min_ver, max_ver]. 'apt-cache madison' lista las versiones de mas nueva a
+# mas antigua, asi que la primera que encaja es la elegida.
+ts_pick_compatible_version() {
+    local pkg="$1" min_ver="$2" max_ver="$3" v
+    while read -r v; do
+        [[ -n "${v}" ]] || continue
+        if ts_ver_ge "${v}" "${min_ver}" && ts_ver_le "${v}" "${max_ver}"; then
+            printf '%s' "${v}"
+            return 0
+        fi
+    done < <(apt-cache madison "${pkg}" 2>/dev/null | awk '{print $3}')
+    return 1
 }
 
 zbx_repo_base() {
@@ -549,26 +685,105 @@ open_port() {
 # NODO BASE DE DATOS: PostgreSQL + TimescaleDB
 # ---------------------------------------------------------------------------
 
+# Indica si un paquete esta disponible en un REPOSITORIO de APT.
+# No basta con mirar 'Candidate:': cuando el paquete ya esta INSTALLED, APT
+# usa /var/lib/dpkg/status como origen del candidato aunque el repositorio no
+# este configurado. Tomarse ese candidato por uno del repositorio hacia que
+# el script se salte la configuracion de la fuente y falle despues sin
+# explicacion. Se busca, por tanto, una entrada de la tabla de versiones con
+# origen http(s) (las de /var/lib/dpkg/status no lo tienen).
+ts_pkg_in_repo() {
+    local pkg="$1" policy
+    policy="$(apt-cache policy "${pkg}" 2>/dev/null || true)"
+    grep -qE "^[[:space:]]+[0-9]+[[:space:]]+https?://" <<<"${policy}"
+}
+
+# Consulta al repositorio de packagecloud si publica un paquete concreto para
+# la suite y arquitectura actuales. Permite distinguir "el repositorio no lo
+# tiene" de "APT local esta roto", que es la raiz del error reportado.
+ts_repo_publishes_pkg() {
+    local base="$1" pkg="$2" arch="$3" idx
+    idx="$(curl -fsSL --retry 2 --connect-timeout 20 \
+            "${base}dists/${DEBIAN_CODENAME}/main/binary-${arch}/Packages.gz" 2>/dev/null \
+            | gzip -dc 2>/dev/null || true)"
+    [[ -n "${idx}" ]] || return 1
+    grep -qE "^Package: ${pkg}$" <<<"${idx}"
+}
+
+# Actualiza los indices y busca un paquete de TimescaleDB utilizable.
+# force_ipv4=1 reintenta por IPv4, necesario en redes con IPv6 roto: APT
+# resuelve el host y se queda sin indice si la ruta IPv6 no responde.
+# En el segundo intento se regenera por completo la cache local de APT.
+ts_try_repo_update() {
+    local force_ipv4="$1"
+    local apt_err="/tmp/zabbix-apt-update.err"
+    local -a opts=()
+    [[ "${force_ipv4}" == "1" ]] && opts+=("-o" "Acquire::ForceIPv4=true")
+    local attempt pkg
+    for attempt in 1 2; do
+        if [[ "${attempt}" == "2" ]]; then
+            rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+            apt-get clean >/dev/null 2>&1 || true
+        else
+            rm -f /var/lib/apt/lists/*timescale* 2>/dev/null || true
+        fi
+        if ! apt-get update ${opts[@]+"${opts[@]}"} -o Acquire::Retries=3 -qq 2>"${apt_err}"; then
+            log_warn "apt-get update devolvio un error:"
+            while read -r line; do log_warn "  ${line}"; done <"${apt_err}"
+        fi
+        for pkg in "${TS_PKG_CANDIDATES[@]}"; do
+            if ts_pkg_in_repo "${pkg}"; then
+                TS_PKG="${pkg}"
+                return 0
+            fi
+        done
+        log_warn "El indice de TimescaleDB aun no esta disponible; se reintenta (intento ${attempt}/2)."
+    done
+    return 1
+}
+
 install_timescaledb_repo() {
     log_step "Configurando repositorio de TimescaleDB"
-    local pkg="timescaledb-2-postgresql-${PG_VERSION}"
+    local arch
+    arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
     # Un candidato real es "Candidate: 2.x.y"; "(none)" significa que no hay paquete.
     # La salida se captura antes de filtrar: con 'set -o pipefail', un 'grep -q'
     # que deja de leer puede devolver 141 (SIGPIPE) y producir un falso negativo.
-    local policy
-    policy="$(apt-cache policy "${pkg}" 2>/dev/null || true)"
-    if grep -qE "Candidate:[[:space:]]*[0-9]" <<<"${policy}"; then
-        log_ok "Repositorio de TimescaleDB ya configurado."
-        return 0
-    fi
+    local pkg
+    for pkg in "${TS_PKG_CANDIDATES[@]}"; do
+        if ts_pkg_in_repo "${pkg}"; then
+            TS_PKG="${pkg}"
+            log_ok "Repositorio de TimescaleDB ya configurado (${pkg})."
+            return 0
+        fi
+    done
+
     log_info_dim "Configurando la fuente de TimescaleDB (packagecloud)"
     local key="/etc/apt/keyrings/timescale_timescaledb-archive-keyring.gpg"
     install -d -m 0755 /etc/apt/keyrings
-    if ! curl -fsSL --retry 3 --connect-timeout 20 https://packagecloud.io/timescale/timescaledb/gpgkey \
-            | gpg --dearmor --yes -o "${key}" 2>/dev/null; then
-        die "No se pudo descargar la clave GPG de TimescaleDB."
+
+    # La clave se descarga a un temporal y se instala solo si es valida. Escribir
+    # directamente sobre el destino deja un keyring corrupto si la transferencia
+    # se corta a medias, y APT rechaza la fuente en todas las ejecuciones
+    # posteriores con un error poco descriptivo.
+    local tmpkey
+    tmpkey="$(mktemp)"
+    if ! curl -fsSL --retry 3 --connect-timeout 20 \
+            https://packagecloud.io/timescale/timescaledb/gpgkey -o "${tmpkey}"; then
+        rm -f "${tmpkey}"
+        die "No se pudo descargar la clave GPG de TimescaleDB: packagecloud.io no es accesible desde esta maquina (compruebe DNS, proxy y salida a Internet)."
     fi
-    chmod 0644 "${key}"
+    if ! gpg --dearmor --yes -o "${tmpkey}.gpg" "${tmpkey}" 2>/dev/null; then
+        rm -f "${tmpkey}" "${tmpkey}.gpg"
+        die "La clave GPG de TimescaleDB no tiene un formato valido."
+    fi
+    if ! gpg --show-keys --with-colons "${tmpkey}.gpg" 2>/dev/null | grep -q '^pub:'; then
+        rm -f "${tmpkey}" "${tmpkey}.gpg"
+        die "La clave GPG de TimescaleDB no contiene ninguna clave publica utilizable."
+    fi
+    install -m 0644 "${tmpkey}.gpg" "${key}"
+    rm -f "${tmpkey}" "${tmpkey}.gpg"
+
     # Se retiran las fuentes timescales previas: duplicar la misma URL con
     # distintos 'signed-by' hace que apt rechace toda la configuracion.
     local f
@@ -577,29 +792,36 @@ install_timescaledb_repo() {
             rm -f "${f}"
         fi
     done
-    cat >/etc/apt/sources.list.d/timescale_timescaledb.list <<TS_EOF
-deb [signed-by=${key}] https://packagecloud.io/timescale/timescaledb/debian/ ${DEBIAN_CODENAME} main
+
+    local src="/etc/apt/sources.list.d/timescale_timescaledb.list"
+    cat >"${src}" <<TS_EOF
+deb [signed-by=${key}] ${TS_REPO_BASE} ${DEBIAN_CODENAME} main
 TS_EOF
-    local apt_err="/tmp/zabbix-apt-update.err"
-    local attempt
-    for attempt in 1 2; do
-        if ! apt-get update -qq 2>"${apt_err}"; then
-            log_warn "apt-get update devolvio un error:"
-            while read -r line; do log_warn "  ${line}"; done <"${apt_err}"
-        fi
-        policy="$(apt-cache policy "${pkg}" 2>/dev/null || true)"
-        if grep -qE "Candidate:[[:space:]]*[0-9]" <<<"${policy}"; then
-            break
-        fi
-        # Si el indice no aparece, se descarta el cache de esa fuente y se reintenta.
-        log_warn "El indice de TimescaleDB aun no esta disponible; se reintenta (intento ${attempt}/2)."
-        rm -f /var/lib/apt/lists/*timescale* 2>/dev/null || true
-        apt-get update -qq 2>"${apt_err}" || true
-    done
-    policy="$(apt-cache policy "${pkg}" 2>/dev/null || true)"
-    grep -qE "Candidate:[[:space:]]*[0-9]" <<<"${policy}" \
-        || die "No hay paquete ${pkg} disponible para ${DEBIAN_CODENAME}."
-    log_ok "Repositorio de TimescaleDB operativo."
+    chmod 0644 "${src}"
+    log_info_dim "Fuente: ${TS_REPO_BASE} ${DEBIAN_CODENAME} main"
+
+    if ts_try_repo_update 0; then
+        log_ok "Repositorio de TimescaleDB operativo (${TS_PKG})."
+        return 0
+    fi
+
+    # Sin indice por la ruta habitual: se reintenta forzando IPv4, que es la
+    # causa habitual en redes con IPv6 sin ruta util.
+    log_warn "Sin indice de TimescaleDB; se reintenta forzando IPv4."
+    if ts_try_repo_update 1; then
+        log_ok "Repositorio de TimescaleDB operativo (${TS_PKG})."
+        return 0
+    fi
+
+    # Diagnostico del fallo: se consulta el indice del repositorio directamente.
+    if ts_repo_publishes_pkg "${TS_REPO_BASE}" "${TS_PKG_CANDIDATES[0]}" "${arch}"; then
+        log_warn "El repositorio si publica ${TS_PKG_CANDIDATES[0]} para ${DEBIAN_CODENAME}; el problema es local (cache de APT, GPG o proxy)."
+    else
+        log_warn "El repositorio no publica ${TS_PKG_CANDIDATES[0]} para ${DEBIAN_CODENAME} (${arch})."
+    fi
+    log_error "No se pudo dejar operativo el repositorio de TimescaleDB."
+    log_error "Revise /tmp/zabbix-apt-update.err y la salida de 'apt-get update' para el detalle del error."
+    die "No hay paquete ${TS_PKG_CANDIDATES[0]} disponible para ${DEBIAN_CODENAME}."
 }
 
 tune_postgresql() {
@@ -818,43 +1040,51 @@ install_db_node() {
         smartmontools >/dev/null 2>&1 \
         || die "Fallo al instalar PostgreSQL. Revise apt y las fuentes configuradas."
 
-    # Zabbix 7.x rechaza las versiones de TimescaleDB mas nuevas que 2.30
-    # ("TimescaleDB version is too new"). Se instala la ultima de la serie 2.30,
-    # compatible con 7.0, 7.4 y 8.0.
+    # La version de TimescaleDB debe caer dentro del rango que admite la rama
+    # de Zabbix elegida (ver zbx_tsdb_min_version/zbx_tsdb_max_version).
+    # El repositorio ya publica 2.32.x, que Zabbix RECHAZA con "TimescaleDB
+    # version is too new", de modo que instalar 'la ultima disponible' sin
+    # fijar la version deja el servidor sin arrancar.
     # TimescaleDB se compone de dos paquetes: el 'loader' (que fija el
     # default_version de la extension) y la Community Edition (con los scripts
     # SQL). Deben instalarse con la MISMA version: si el loader va por delante,
     # la extension no encuentra su script de instalacion.
-    local ts_pkg="timescaledb-2-postgresql-${PG_VERSION}"
+    local ts_pkg="${TS_PKG:-timescaledb-2-postgresql-${PG_VERSION}}"
     local ts_loader="timescaledb-2-loader-postgresql-${PG_VERSION}"
+    if [[ "${ts_pkg}" == "timescaledb-2-oss-postgresql-${PG_VERSION}" ]]; then
+        log_warn "Se usa la Apache 2 Edition de TimescaleDB: el servidor funciona, pero sin compresion."
+    fi
     local ts_ver=""
-    local ts_max ts_series
-    ts_max="$(zbx_max_ts_version "${ZBX_VERSION}")"
-    ts_series="${ts_max%.*}"
-    ts_ver="$(apt-cache madison "${ts_loader}" 2>/dev/null | awk '{print $3}' | grep -E "^${ts_series}\." | head -1 || true)"
+    local ts_min ts_max
+    ts_min="$(zbx_tsdb_min_version "${ZBX_VERSION}")"
+    ts_max="$(zbx_tsdb_max_version "${ZBX_VERSION}")"
+    ts_ver="$(ts_pick_compatible_version "${ts_loader}" "${ts_min}" "${ts_max}" || true)"
     if [[ -z "${ts_ver}" ]]; then
-        ts_ver="$(apt-cache madison "${ts_pkg}" 2>/dev/null | awk '{print $3}' | grep -E "^${ts_series}\." | head -1 || true)"
+        ts_ver="$(ts_pick_compatible_version "${ts_pkg}" "${ts_min}" "${ts_max}" || true)"
     fi
     if [[ -z "${ts_ver}" ]]; then
-        ts_ver="$(apt-cache madison "${ts_loader}" 2>/dev/null | awk '{print $3}' | head -1 || true)"
+        log_error "Versiones disponibles de ${ts_pkg}:"
+        apt-cache madison "${ts_pkg}" 2>/dev/null | awk '{print "    " $3}' || true
+        die "El repositorio de TimescaleDB no ofrece ninguna version compatible con Zabbix ${ZBX_VERSION} (se requiere ${ts_min} - ${ts_max})."
     fi
-    if [[ -n "${ts_ver}" ]]; then
-        log_info_dim "Instalando TimescaleDB ${ts_ver} (compatible con Zabbix ${ZBX_VERSION})."
-        apt-get install -y -qq --allow-downgrades \
-            "${ts_loader}=${ts_ver}" "${ts_pkg}=${ts_ver}" >/dev/null 2>&1 \
-            || die "No se pudo instalar TimescaleDB ${ts_ver}."
-    else
-        log_warn "No se encontro una version 2.30 de TimescaleDB; se instala la disponible."
-        apt-get install -y -qq --no-install-recommends "${ts_pkg}" >/dev/null 2>&1 \
-            || die "No se pudo instalar ${ts_pkg}."
-    fi
+    log_info_dim "Instalando TimescaleDB ${ts_ver} (rango admitido por Zabbix ${ZBX_VERSION}: ${ts_min} - ${ts_max%.*}.x)."
+    apt-get install -y -qq --allow-downgrades \
+        "${ts_loader}=${ts_ver}" "${ts_pkg}=${ts_ver}" >/dev/null 2>&1 \
+        || die "No se pudo instalar TimescaleDB ${ts_ver}."
+
     # La extension debe tener su script de instalacion disponible.
     local ts_ver_real
     ts_ver_real="$(dpkg-query -W -f='${Version}' "${ts_pkg}" 2>/dev/null | cut -d'~' -f1 || true)"
+    if [[ -n "${ts_ver_real}" ]] && ! ts_ver_le "${ts_ver_real}" "${ts_max}"; then
+        die "La version de TimescaleDB instalada (${ts_ver_real}) es superior a la maxima admitida por Zabbix ${ZBX_VERSION} (${ts_max%.*}.x): el servidor Zabbix abortaria con 'TimescaleDB version is too new'."
+    fi
+    if [[ -n "${ts_ver_real}" ]] && ! ts_ver_ge "${ts_ver_real}" "${ts_min}"; then
+        die "La version de TimescaleDB instalada (${ts_ver_real}) es anterior a la minima admitida por Zabbix ${ZBX_VERSION} (${ts_min})."
+    fi
     if [[ -n "${ts_ver_real}" && ! -f "/usr/share/postgresql/${PG_VERSION}/extension/timescaledb--${ts_ver_real}.sql" ]]; then
         die "Falta el script de instalacion de la extension timescaledb ${ts_ver_real}."
     fi
-    log_ok "PostgreSQL ${PG_VERSION} y TimescaleDB instalados."
+    log_ok "PostgreSQL ${PG_VERSION} y TimescaleDB ${ts_ver_real:-${ts_ver}} instalados."
 
     setup_postgres_cluster
     tune_postgresql
@@ -1158,6 +1388,31 @@ install_server_node() {
         log_warn "Verifique que el nodo de base de datos esta instalado y que pg_hba.conf permite ${ZBX_SERVER_IP}."
     fi
 
+    log_step "Comprobando la version de TimescaleDB en la base de datos"
+    # El limite lo impone el zabbix-server INSTALADO, no la tabla del script:
+    # el limite cambia entre revisiones de una misma rama. Si la extension de
+    # la BD es mas nueva que ese limite, el servidor aborta al arrancar con
+    # "TimescaleDB version is too new".
+    local srv_tsdb_max tsdb_ver db_tsdb_ver
+    srv_tsdb_max="$(zbx_server_tsdb_max || true)"
+    if [[ -n "${srv_tsdb_max}" ]]; then
+        log_info_dim "zabbix-server admite como maximo TimescaleDB ${srv_tsdb_max%.*}.x"
+        db_tsdb_ver="$(PGPASSWORD="${ZBX_DB_PASSWORD}" psql -h "${ZBX_DB_HOST}" -p "${ZBX_DB_PORT}" \
+            -U "${ZBX_DB_USER}" -d "${ZBX_DB_NAME}" -tAc \
+            "SELECT extversion FROM pg_extension WHERE extname='timescaledb'" 2>/dev/null | tr -d '[:space:]' || true)"
+        tsdb_ver="${db_tsdb_ver}"
+        if [[ -n "${tsdb_ver}" ]] && ! ts_ver_le "${tsdb_ver}" "${srv_tsdb_max}"; then
+            die "La base de datos tiene TimescaleDB ${tsdb_ver}, pero el zabbix-server instalado admite como maximo ${srv_tsdb_max%.*}.x. En el nodo de base de datos ejecute: apt-get install -y --allow-downgrades timescaledb-2-loader-postgresql-${PG_VERSION}=<VERSION> timescaledb-2-postgresql-${PG_VERSION}=<VERSION> (VERSION ${tsdb_ver} o anterior de esa serie)."
+        fi
+        if [[ -n "${tsdb_ver}" ]]; then
+            log_ok "TimescaleDB ${tsdb_ver} en la base de datos, dentro del rango admitido."
+        else
+            log_info_dim "No se ha podido leer la version de TimescaleDB desde la base de datos; se continuara."
+        fi
+    else
+        log_info_dim "No se ha podido determinar el limite de version del zabbix-server; se continuara."
+    fi
+
     log_step "Habilitando y arrancando servicios"
     systemctl enable zabbix-server zabbix-agent2 nginx >/dev/null 2>&1 || true
     local php_ver
@@ -1184,7 +1439,12 @@ install_server_node() {
         log_error "El servicio zabbix-server no queda activo. Ultimas lineas del journal:"
         while read -r line; do log_warn "  ${line}"; done <<<"${jlog}"
         if grep -qi "timescaledb version is too new" <<<"${jlog}"; then
-            die "La version de TimescaleDB instalada es demasiado nueva para Zabbix ${ZBX_VERSION}. Instale una version 2.30.x de timescaledb-2-postgresql-${PG_VERSION}."
+            # El propio servidor indica cual es la version recomendada.
+            local recommended
+            recommended="$(grep -aioE 'recommended version is up to .*2\.[0-9]+\.x' <<<"${jlog}" \
+                | grep -oE '2\.[0-9]+\.x' | tail -1 || true)"
+            [[ -n "${recommended}" ]] || recommended="$(zbx_tsdb_max_version "${ZBX_VERSION}" | cut -d. -f1,2).x"
+            die "La version de TimescaleDB instalada es demasiado nueva para Zabbix ${ZBX_VERSION} (admite como maximo ${recommended}). En el nodo de base de datos ejecute: apt-get install -y --allow-downgrades timescaledb-2-loader-postgresql-${PG_VERSION}=<VERSION> timescaledb-2-postgresql-${PG_VERSION}=<VERSION> con una version de la serie ${recommended}."
         fi
         die "El servicio zabbix-server no arranca. Revise journalctl -u zabbix-server."
     fi
