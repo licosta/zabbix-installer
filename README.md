@@ -35,14 +35,28 @@ la base de datos. Al final muestra un resumen de la instalacion antes de ejecuta
 
 ## Versiones soportadas
 
-| Zabbix | Repositorio oficial | TimescaleDB |
+| Zabbix | Repositorio oficial | TimescaleDB admitida |
 | --- | --- | --- |
-| 7.0 (LTS) | `repo.zabbix.com/zabbix/7.0/debian` | 2.29.2 |
-| 7.4 | `repo.zabbix.com/zabbix/7.4/stable/debian` | 2.30.2 |
-| 8.0 (LTS) | `repo.zabbix.com/zabbix/8.0/stable/debian` | 2.29.2 |
+| 7.0 (LTS) | `repo.zabbix.com/zabbix/7.0/debian` | 2.13.0 - 2.30.x |
+| 7.4 | `repo.zabbix.com/zabbix/7.4/stable/debian` | 2.13.0 - 2.30.x |
+| 8.0 (LTS) | `repo.zabbix.com/zabbix/8.0/stable/debian` | 2.20.0 - 2.29.x |
 
 La version de TimescaleDB se fija por version de Zabbix: el servidor Zabbix rechaza
-arrancar con una version de TimescaleDB demasiado nueva.
+arrancar con una version de TimescaleDB demasiado nueva. El rango no es arbitrario,
+es el que fija el propio codigo de cada revision (`ZBX_TIMESCALE_MIN_SUPPORTED_VERSION`
+y `ZBX_TIMESCALE_MAX_VERSION` en `include/zbx_dbversion_constants.h`).
+
+El rango **cambia entre revisiones de una misma rama**: `8.0.0` admite hasta 2.29.x,
+mientras que las revisiones posteriores de la rama 8.0 ya admiten 2.30.x y 2.31.x.
+Por eso el instalador:
+
+- instala siempre la revision mas nueva de la serie maxima admitida por la rama
+  elegida, en lugar de "la ultima publicada" (el repositorio de packagecloud ya
+  publica 2.32.x, que **ninguna** de estas ramas acepta: el servidor abortaria
+  con `TimescaleDB version is too new`);
+- comprueba en el nodo servidor la version de TimescaleDB de la base de datos
+  contra el limite que declara el propio binario `zabbix-server` instalado, y
+  avisa con el comando exacto a ejecutar si no encaja.
 
 ## Orden de ejecucion (modo nativo)
 
