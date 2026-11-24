@@ -1541,7 +1541,11 @@ tune_php() {
 memory_limit = 256M
 upload_max_filesize = 16M
 post_max_size = 16M
+; El frontend de Zabbix 8.0 comprueba estos limites en la pantalla de login y
+; avisa si no se cumplen: max_input_time y max_execution_time deben ser 300 o
+; mas, y memory_limit 128M o mas.
 max_execution_time = 300
+max_input_time = 300
 max_input_vars = 10000
 date.timezone = ${ZBX_TIMEZONE}
 opcache.enable = 1
@@ -1559,7 +1563,21 @@ PHPINI_EOF
         sed -i -E "s@^;?[[:space:]]*pm\.min_spare_servers[[:space:]]*=.*@pm.min_spare_servers = 2@" "${pool}"
         sed -i -E "s@^;?[[:space:]]*pm\.max_spare_servers[[:space:]]*=.*@pm.max_spare_servers = 8@" "${pool}"
         sed -i -E "s@^;?[[:space:]]*pm\.process_idle_timeout[[:space:]]*=.*@pm.process_idle_timeout = 30s@" "${pool}"
-        systemctl restart "php${php_ver}-fpm" >/dev/null 2>&1 || true
+    fi
+    systemctl restart "php${php_ver}-fpm" >/dev/null 2>&1 || true
+
+    # El frontend de Zabbix comprueba estos limites al arrancar y los muestra
+    # como error en la pantalla de login si no se cumplen.
+    local eff_mit eff_met eff_mem
+    eff_mit="$(php-fpm"${php_ver}" -i 2>/dev/null | awk -F' => ' '/^max_input_time/ {print $2; exit}')"
+    eff_met="$(php-fpm"${php_ver}" -i 2>/dev/null | awk -F' => ' '/^max_execution_time/ {print $2; exit}')"
+    eff_mem="$(php-fpm"${php_ver}" -i 2>/dev/null | awk -F' => ' '/^memory_limit/ {print $2; exit}')"
+    if [[ -n "${eff_mit}" && -n "${eff_met}" ]]; then
+        if (( eff_mit < 300 || eff_met < 300 )); then
+            log_warn "Los limites de PHP no cumplen lo que exige el frontend de Zabbix (max_input_time=${eff_mit}, max_execution_time=${eff_met}): se esperan 300 o mas."
+        else
+            log_ok "Limites de PHP para el frontend: max_input_time=${eff_mit}, max_execution_time=${eff_met}, memory_limit=${eff_mem:-?}."
+        fi
     fi
     log_ok "PHP ${php_ver} optimizado (pm.max_children=${max_children})."
 }
